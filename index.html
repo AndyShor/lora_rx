@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#111111">
+<title>LoRa RX</title>
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<style>
+  :root { --bg:#fafafa; --fg:#111; --muted:#777; --line:#e3e3e3; --card:#fff; --ok:#1f9d55; --warn:#c27c0e; --err:#c0392b; --accent:#111; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#111; --fg:#eaeaea; --muted:#8a8a8a; --line:#262626; --card:#181818; --accent:#eaeaea; } }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+  body { display:flex; flex-direction:column; }
+  header { display:flex; flex-wrap:wrap; align-items:center; gap:10px; padding:12px 16px; padding-top:max(12px, env(safe-area-inset-top)); border-bottom:1px solid var(--line); }
+  h1 { font-size:16px; font-weight:600; margin:0; flex:1; }
+  #dot { width:10px; height:10px; border-radius:50%; background:var(--muted); flex:none; }
+  #dot.ok { background:var(--ok); } #dot.warn { background:var(--warn); } #dot.err { background:var(--err); }
+  #status { order:9; flex-basis:100%; color:var(--muted); font-size:13px; }
+  #status.err { color:var(--err); }
+  button { font:inherit; font-size:14px; padding:7px 14px; border-radius:8px; cursor:pointer; border:1px solid var(--line); background:var(--card); color:var(--fg); }
+  button.primary { background:var(--accent); color:var(--bg); border-color:var(--accent); }
+  button:disabled { opacity:.45; cursor:default; }
+  #diag { display:grid; grid-template-columns:auto 1fr; gap:2px 12px; padding:8px 16px; border-bottom:1px solid var(--line); font-size:12.5px; }
+  #diag .k { color:var(--muted); white-space:nowrap; }
+  #diag .v { word-break:break-word; }
+  #diag .v::before { display:inline-block; width:3.2em; font-weight:600; }
+  #diag .v.ok::before { content:"OK"; color:var(--ok); } #diag .v.fail::before { content:"FAIL"; color:var(--err); }
+  #diag .v.wait::before { content:"…"; color:var(--warn); } #diag .v.idle::before { content:"–"; color:var(--muted); }
+  main { flex:1; overflow-y:auto; padding:12px 16px; }
+  #empty { color:var(--muted); text-align:center; margin-top:18vh; }
+  .msg { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 12px; margin:0 0 8px; }
+  .msg .text { font-size:16px; word-break:break-word; white-space:pre-wrap; }
+  .msg .meta { color:var(--muted); font-size:12px; margin-top:4px; font-variant-numeric:tabular-nums; }
+  .msg.err { border-color:var(--err); } .msg.err .text { color:var(--err); font-size:14px; }
+  details { border-top:1px solid var(--line); padding:8px 16px; padding-bottom:max(8px, env(safe-area-inset-bottom)); }
+  summary { color:var(--muted); font-size:13px; cursor:pointer; }
+  #log { margin:8px 0 0; max-height:30vh; overflow-y:auto; font:12px/1.35 ui-monospace,Menlo,Consolas,monospace; color:var(--muted); white-space:pre-wrap; word-break:break-all; }
+</style>
+</head>
+<body>
+<header>
+  <span id="dot"></span>
+  <h1>LoRa RX <small id="ver" style="font-weight:400;color:var(--muted);font-size:12px"></small></h1>
+  <button id="btnConnect" class="primary">Connect</button>
+  <button id="btnAlt" hidden></button>
+  <button id="btnClear">Clear</button>
+  <div id="status">not connected</div>
+</header>
+<section id="diag" aria-label="Connection checks">
+  <span class="k">App version</span><span class="v idle" id="d-ver"></span>
+  <span class="k">Secure address</span><span class="v idle" id="d-secure"></span>
+  <span class="k">Browser API</span><span class="v idle" id="d-api"></span>
+  <span class="k">Port chosen</span><span class="v idle" id="d-port">not yet</span>
+  <span class="k">Port opened</span><span class="v idle" id="d-open">not yet</span>
+  <span class="k">Data from board</span><span class="v idle" id="d-data">none yet</span>
+  <span class="k">Last line</span><span class="v idle" id="d-last">—</span>
+</section>
+<main id="list"><div id="empty">No messages yet.<br>Connect the RX board.</div></main>
+<details>
+  <summary>Device log</summary>
+  <div id="log"></div>
+</details>
+
+<script>
+"use strict";
+/*
+ * LoRa RX viewer for the lora_link RX firmware (ESP32-S3 USB-Serial/JTAG, 303a:1001).
+ * Firmware lines: "RX,<n>,<rssi>,<snr>,<text>" | "RX_ERR,irq=0x...." | status lines.
+ *
+ * Transport:
+ *   Desktop  -> Web Serial (opens the OS serial port, e.g. /dev/ttyACM0).
+ *   Android  -> WebUSB. Chrome on Android has Web Serial since 148, but USB serial devices are
+ *               only covered via the Android Serial API on a few devices (blink-dev PSA), so
+ *               WebUSB is used: claim CDC control interface (Chrome on Android detaches a kernel
+ *               cdc_acm driver only for that interface), then the CDC data interface, then send
+ *               SET_CONTROL_LINE_STATE DTR+RTS (0x03) exactly as Linux cdc_acm does on port open.
+ *   A second button switches to the other method when the browser has both APIs.
+ */
+const APP_VERSION = "v6";               // must match CACHE in sw.js
+const VID = 0x303a, PID = 0x1001;
+const MAX_MSGS = 500, MAX_LOG = 300;
+const IS_ANDROID = navigator.userAgentData ? navigator.userAgentData.platform === "Android" : /Android/i.test(navigator.userAgent);
+const HAS_SERIAL = "serial" in navigator, HAS_USB = "usb" in navigator;
+let method = IS_ANDROID ? (HAS_USB ? "usb" : HAS_SERIAL ? "serial" : null) : (HAS_SERIAL ? "serial" : HAS_USB ? "usb" : null);
+try { const m = localStorage.getItem("lora-rx-method"); if ((m === "usb" && HAS_USB) || (m === "serial" && HAS_SERIAL)) method = m; } catch {}
+const methodName = (m) => (m === "usb" ? "WebUSB" : m === "serial" ? "Web Serial" : "none");
+
+const $ = (id) => document.getElementById(id);
+$("ver").textContent = APP_VERSION;
+const list = $("list"), logEl = $("log"), dot = $("dot"), statusEl = $("status"), btn = $("btnConnect");
+
+let conn = null;          // active connection: { kind, close(), port?, device? }
+let busy = false;         // a connect/disconnect is in progress
+let lineBuf = "", decoder = new TextDecoder(), msgCount = 0;
+
+/* ---------------- UI helpers ---------------- */
+function setStatus(text, cls) {
+  statusEl.textContent = text;
+  statusEl.className = cls === "err" ? "err" : "";
+  dot.className = cls || "";
+}
+function log(line) {
+  const d = document.createElement("div"); d.textContent = line; logEl.appendChild(d);
+  while (logEl.childElementCount > MAX_LOG) logEl.firstChild.remove();
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function fail(text, detail) {          // show a problem in the status line and keep details in the log
+  setStatus(text, "err");
+  log("[app] " + text + (detail ? " (" + detail + ")" : ""));
+}
+function addMsg(text, meta, isErr) {
+  $("empty")?.remove();
+  const stick = list.scrollTop + list.clientHeight >= list.scrollHeight - 40;
+  const card = document.createElement("div"); card.className = "msg" + (isErr ? " err" : "");
+  const t = document.createElement("div"); t.className = "text"; t.textContent = text;
+  const m = document.createElement("div"); m.className = "meta"; m.textContent = meta;
+  card.append(t, m); list.appendChild(card);
+  while (list.childElementCount > MAX_MSGS) list.firstChild.remove();
+  if (stick) list.scrollTop = list.scrollHeight;
+}
+function refreshButton() {
+  btn.disabled = busy;
+  btn.textContent = conn ? "Disconnect" : "Connect";
+  if (typeof refreshAlt === "function") refreshAlt();
+}
+/* status panel: state = "ok" | "fail" | "wait" | "idle" */
+function stage(id, state, text) { const el = $("d-" + id); el.className = "v " + state; el.textContent = " " + text; }
+let bytesIn = 0, lastDataAt = 0, dataTimer = null;
+function startDataWatch() {
+  bytesIn = 0; lastDataAt = Date.now();
+  stage("data", "wait", "connected, waiting for the board to send");
+  clearInterval(dataTimer);
+  dataTimer = setInterval(() => {
+    if (!conn) { clearInterval(dataTimer); return; }
+    const idle = Math.round((Date.now() - lastDataAt) / 1000);
+    if (bytesIn === 0 && idle >= 30) stage("data", "fail", "nothing received for " + idle + " s — is the RX board running this firmware, and is the TX board powered?");
+    else if (bytesIn > 0 && idle >= 30) stage("data", "wait", bytesIn + " bytes total, nothing new for " + idle + " s — is the TX board powered?");
+  }, 5000);
+}
+const clock = () => new Date().toLocaleTimeString([], { hour12: false });
+const connectedLabel = () => (conn ? conn.kind : "") + " · " + (msgCount ? msgCount + " received" : "connected");
+
+/* ---------------- parsing ---------------- */
+function handleLine(raw) {
+  const line = raw.replace(/\x1b\[[0-9;]*m/g, "").trimEnd();
+  if (!line) return;
+  stage("last", "ok", line.length > 120 ? line.slice(0, 120) + "…" : line);
+  if (line.startsWith("RX,") && line !== "RX,listening") {
+    const p = line.split(",");
+    if (p.length >= 5 && /^\d+$/.test(p[1]) && /^-?\d+$/.test(p[2]) && /^-?\d+$/.test(p[3])) {
+      msgCount++;
+      addMsg(p.slice(4).join(","), `${clock()}  ·  #${p[1]}  ·  RSSI ${p[2]} dBm  ·  SNR ${p[3]} dB`, false);
+      setStatus(connectedLabel(), "ok");
+      return;
+    }
+  }
+  if (line.startsWith("RX_ERR")) { addMsg("Corrupted packet (" + line.slice(7) + ")", clock(), true); return; }
+  if (line === "RX,listening") setStatus(conn ? conn.kind + " · listening" : "listening", "ok");
+  if (line.startsWith("HALT")) setStatus("board reports: radio init failed", "err");
+  log(line);
+}
+function feed(bytes) {
+  bytesIn += bytes.length; lastDataAt = Date.now();
+  stage("data", "ok", bytesIn + " bytes received");
+  lineBuf += decoder.decode(bytes, { stream: true });
+  const parts = lineBuf.split(/\r?\n/);
+  lineBuf = parts.pop();
+  if (lineBuf.length > 4096) { parts.push(lineBuf); lineBuf = ""; }   // guard against a stream with no newlines
+  parts.forEach(handleLine);
+}
+window.loraFeedText = (s) => feed(new TextEncoder().encode(s));        // test hook
+
+function resetStream() { decoder = new TextDecoder(); lineBuf = ""; }
+
+/* ---------------- Web Serial ---------------- */
+async function serialOpen(port) {
+  try {
+    await port.open({ baudRate: 115200 });           // value ignored by USB CDC, required by the API
+  } catch (e) {
+    if (e.name === "InvalidStateError") { /* already open by this page: continue */ }
+    else throw Object.assign(new Error("open"), { cause: e, stage: "open" });
+  }
+  let alive = true, reader = null;
+  conn = {
+    kind: "Serial", port,
+    close: async () => { alive = false; try { await reader?.cancel(); } catch {} try { await port.close(); } catch {} },
+  };
+  resetStream();
+  setStatus("Serial · connected, waiting for data", "ok");
+  stage("open", "ok", "serial port open");
+  startDataWatch();
+  (async () => {
+    while (alive && port.readable) {
+      try {
+        reader = port.readable.getReader();
+      } catch (e) {
+        log("[app] port stream unavailable: " + e.message);
+        break;
+      }
+      try {
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          if (value) feed(value);
+        }
+      } catch (e) {
+        log("[app] read error: " + e.name + ": " + e.message);   // non-fatal errors get a fresh stream
+        resetStream();                                            // drop the half line received before the error
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+    }
+    if (alive) { stage("open", "fail", "port closed by the system (board unplugged or reset)"); lost("serial port closed (board unplugged or reset)"); }
+  })();
+}
+
+async function serialConnect() {
+  let port;
+  try {
+    port = await navigator.serial.requestPort();      // no filter: every serial port is listed
+    const i = port.getInfo ? port.getInfo() : {};
+    stage("port", "ok", i.usbVendorId !== undefined ? "USB " + i.usbVendorId.toString(16).padStart(4, "0") + ":" + (i.usbProductId ?? 0).toString(16).padStart(4, "0") + (i.usbVendorId === VID ? " (Espressif)" : " — not the Espressif board?") : "selected (no USB IDs reported by the browser)");
+  } catch (e) {
+    stage("port", "fail", e.name === "NotFoundError" ? "no port selected — if the list was empty, the browser cannot see the board" : e.name + ": " + e.message);
+    if (e.name === "NotFoundError") {
+      fail("No port selected. If the board was not in the list: check the USB cable; on Linux the user needs the dialout group, and Snap/Flatpak browsers may not see serial ports.", e.message);
+    } else if (e.name === "SecurityError") {
+      fail("Serial access blocked by the browser.", e.message);
+    } else fail("Serial error: " + e.message, e.name);
+    return;
+  }
+  try {
+    await serialOpen(port);
+  } catch (e) {
+    const c = e.cause || e;
+    stage("open", "fail", c.name + ": " + c.message);
+    fail("Could not open the port. Close other programs using it (idf.py monitor, picocom, Arduino IDE) and check permissions.", c.name + ": " + c.message);
+  }
+}
+
+/* ---------------- WebUSB (used only when Web Serial is unavailable, e.g. Android) ---------------- */
+async function usbOpen(device) {
+  try { await device.open(); }
+  catch (e) { throw Object.assign(new Error("open"), { cause: e, stage: "open" }); }
+  try { if (device.configuration === null) await device.selectConfiguration(1); }
+  catch (e) { await device.close().catch(() => {}); throw Object.assign(new Error("config"), { cause: e, stage: "config" }); }
+
+  // Find the CDC control interface (class 0x02, subclass 0x02) and the CDC data interface (class 0x0A, bulk IN).
+  let ctrl = null, data = null, dataAlt = null, ep = null;
+  for (const i of device.configuration.interfaces) {
+    for (const a of i.alternates) {
+      if (!ctrl && a.interfaceClass === 0x02 && a.interfaceSubclass === 0x02) ctrl = i;
+      if (!ep && a.interfaceClass === 0x0a) {
+        const e = a.endpoints.find((x) => x.direction === "in" && x.type === "bulk");
+        if (e) { data = i; dataAlt = a; ep = e; }
+      }
+    }
+  }
+  if (!ep) { await device.close().catch(() => {}); throw Object.assign(new Error("no CDC data interface with a bulk IN endpoint"), { stage: "iface" }); }
+
+  // Control interface first: on Android, Chrome detaches a bound cdc_acm kernel driver only when the
+  // CDC-ACM control interface is claimed; that also frees the data interface.
+  try {
+    if (ctrl) await device.claimInterface(ctrl.interfaceNumber);
+    await device.claimInterface(data.interfaceNumber);
+  } catch (e) { await device.close().catch(() => {}); throw Object.assign(new Error("claim"), { cause: e, stage: "claim" }); }
+  if (dataAlt.alternateSetting !== 0) await device.selectAlternateInterface(data.interfaceNumber, dataAlt.alternateSetting);
+
+  // SET_CONTROL_LINE_STATE (0x22) DTR+RTS = 0x03 in one request, as Linux cdc_acm sends on open.
+  const lineState = async (v) => {
+    if (!ctrl) return;
+    await device.controlTransferOut({ requestType: "class", recipient: "interface", request: 0x22, value: v, index: ctrl.interfaceNumber });
+  };
+  try { await lineState(0x03); } catch (e) { log("[app] SET_CONTROL_LINE_STATE failed: " + e.message); }
+
+  let alive = true;
+  conn = { kind: "USB", device, close: async () => {
+    alive = false;
+    try { await lineState(0x00); } catch {}              // as Linux cdc_acm sends on close
+    try { await device.close(); } catch {}
+  } };
+  resetStream();
+  setStatus("USB · connected, waiting for data", "ok");
+  stage("open", "ok", "USB interfaces claimed" + (ctrl ? " (control " + ctrl.interfaceNumber + ", data " + data.interfaceNumber + ")" : " (data " + data.interfaceNumber + ")"));
+  startDataWatch();
+  (async () => {
+    while (alive) {
+      try {
+        const r = await device.transferIn(ep.endpointNumber, ep.packetSize || 64);
+        if (r.status === "stall") { await device.clearHalt("in", ep.endpointNumber); continue; }
+        if (r.data && r.data.byteLength) feed(new Uint8Array(r.data.buffer, r.data.byteOffset, r.data.byteLength));
+      } catch (e) {
+        if (alive) { stage("open", "fail", "USB read stopped: " + e.message); lost("USB read stopped (" + e.message + ")"); }
+        return;
+      }
+    }
+  })();
+}
+
+function usbError(e) {
+  const c = e.cause || e;
+  stage("open", "fail", (e.stage === "claim" ? "claim failed: " : e.stage === "open" ? "open failed: " : "") + c.name + ": " + (c.message || e.message));
+  if (e.stage === "open") return fail(IS_ANDROID ? "USB access refused. Re-plug the board and accept Android's USB permission prompt." : "USB access denied by the system. On desktop Linux use Web Serial (the other button).", c.name + ": " + c.message);
+  if (e.stage === "claim") return fail(IS_ANDROID ? "Could not claim the board's USB interface. Close other apps using the board and re-plug it." : "The board's USB interface is held by an OS driver. On desktop use Web Serial (the other button).", c.name + ": " + c.message);
+  fail("USB error: " + (c.message || e.message), c.name);
+}
+
+async function usbConnect() {
+  let device;
+  try {
+    device = await navigator.usb.requestDevice({ filters: [{ vendorId: VID }] });
+    stage("port", "ok", "USB " + device.vendorId.toString(16).padStart(4, "0") + ":" + device.productId.toString(16).padStart(4, "0"));
+  } catch (e) {
+    stage("port", "fail", e.name === "NotFoundError" ? "no device selected — if the list was empty, the browser cannot see the board" : e.name + ": " + e.message);
+    if (e.name === "NotFoundError") fail("No device selected. If the board was not listed, check the USB/OTG cable.", e.message);
+    else fail("USB error: " + e.message, e.name);
+    return;
+  }
+  try { await usbOpen(device); } catch (e) { usbError(e); }
+}
+
+/* ---------------- connect / disconnect ---------------- */
+function lost(reason) {
+  conn = null; refreshButton(); clearInterval(dataTimer);
+  if (!$("d-open").classList.contains("fail")) stage("open", "fail", reason);
+  setStatus(reason, "warn"); log("[app] " + reason);
+}
+
+async function onConnectClick() {
+  if (busy) return;
+  busy = true; refreshButton();
+  try {
+    if (conn) {
+      const c = conn; conn = null;
+      await c.close(); clearInterval(dataTimer);
+      stage("open", "idle", "closed by you"); stage("data", "idle", bytesIn + " bytes received before closing");
+      setStatus("disconnected", "");
+    } else if (!window.isSecureContext) {
+      fail("This page must be opened via https:// or http://localhost for device access.");
+    } else if (method === "serial") {
+      setStatus("choose the board's serial port…", "warn");
+      await serialConnect();
+    } else if (method === "usb") {
+      setStatus("choose the board…", "warn");
+      await usbConnect();
+    } else {
+      fail("This browser has neither Web Serial nor WebUSB. Use Chrome, Edge, Chromium or Brave (desktop or Android), or Firefox 151+ on desktop.");
+    }
+  } finally {
+    busy = false; refreshButton();
+  }
+}
+
+btn.addEventListener("click", onConnectClick);
+const btnAlt = $("btnAlt");
+function refreshAlt() {
+  btnAlt.hidden = !(HAS_SERIAL && HAS_USB) || !!conn;
+  btnAlt.textContent = "Use " + methodName(method === "usb" ? "serial" : "usb") + " instead";
+  stage("api", method ? "ok" : "fail", method ? methodName(method) + (IS_ANDROID ? " (Android)" : "") : (window.isSecureContext ? "neither Web Serial nor WebUSB in this browser" : "hidden on non-secure addresses"));
+}
+btnAlt.addEventListener("click", () => {
+  method = method === "usb" ? "serial" : "usb";
+  try { localStorage.setItem("lora-rx-method", method); } catch {}
+  refreshAlt();
+  setStatus("method: " + methodName(method) + " — press Connect", "");
+});
+$("btnClear").addEventListener("click", () => {
+  list.replaceChildren(); logEl.replaceChildren(); msgCount = 0;
+  setStatus(conn ? conn.kind + " · connected" : "not connected", conn ? "ok" : "");
+});
+
+/* Reconnect automatically to ports/devices this site was already allowed to use. */
+async function autoConnect() {
+  if (conn || busy || !window.isSecureContext) return;
+  busy = true; refreshButton();
+  try {
+    if (method === "serial" && navigator.serial.getPorts) {
+      const ports = await navigator.serial.getPorts();
+      for (const p of ports) {
+        const info = p.getInfo ? p.getInfo() : {};
+        if (info.usbVendorId !== undefined && info.usbVendorId !== VID) continue;
+        try { stage("port", "ok", "previously allowed port"); await serialOpen(p); log("[app] reconnected to known serial port"); break; } catch (e) { stage("open", "fail", (e.cause || e).name + ": " + (e.cause || e).message); }
+      }
+    } else if (method === "usb") {
+      const devs = await navigator.usb.getDevices();
+      const d = devs.find((x) => x.vendorId === VID && x.productId === PID);
+      if (d) { try { stage("port", "ok", "previously allowed device"); await usbOpen(d); log("[app] reconnected to known USB device"); } catch (e) { usbError(e); } }
+    }
+  } catch (e) { log("[app] auto-reconnect skipped: " + e.message); }
+  finally { busy = false; refreshButton(); }
+}
+
+if ("serial" in navigator) {
+  navigator.serial.addEventListener("connect", () => setTimeout(autoConnect, 500));
+  navigator.serial.addEventListener("disconnect", (e) => {
+    const p = e.port || e.target;
+    if (conn && conn.kind === "Serial" && conn.port === p) { const c = conn; conn = null; c.close(); lost("board unplugged"); }
+  });
+}
+if ("usb" in navigator) {
+  navigator.usb.addEventListener("connect", () => setTimeout(autoConnect, 500));
+  navigator.usb.addEventListener("disconnect", (e) => {
+    if (conn && conn.kind === "USB" && conn.device === e.device) { const c = conn; conn = null; c.close(); lost("board unplugged"); }
+  });
+}
+autoConnect();
+
+stage("ver", "ok", APP_VERSION);
+stage("secure", window.isSecureContext ? "ok" : "fail", window.isSecureContext ? location.origin : location.origin + " is not secure — use http://localhost or https://");
+refreshAlt();
+if (!window.isSecureContext) {
+  setStatus("open this page via https:// or http://localhost — device access is disabled on this address", "err");
+} else if (!("serial" in navigator) && !("usb" in navigator)) {
+  setStatus("this browser has neither Web Serial nor WebUSB", "err");
+}
+
+/* Offline support. */
+if ("serviceWorker" in navigator) {
+  const hadController = !!navigator.serviceWorker.controller;
+  let reloaded = false;
+  navigator.serviceWorker.addEventListener("controllerchange", () => {
+    if (hadController && !reloaded && !conn) { reloaded = true; location.reload(); }   // new version installed: show it
+  });
+  navigator.serviceWorker.register("sw.js").catch((e) => log("[app] offline cache not installed: " + e.message));
+}
+</script>
+</body>
+</html>
